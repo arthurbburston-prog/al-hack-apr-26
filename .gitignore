@@ -1,3 +1,6 @@
 *.env
 *.secret
 *.ignoreme
+
+# Streamlit secrets
+.streamlit/secrets.toml
