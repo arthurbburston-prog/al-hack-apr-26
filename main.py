@@ -1,6 +1,7 @@
-def main():
-    print("Hello from al-hack-apr-26!")
+import streamlit as st
 
-
-if __name__ == "__main__":
-    main()
+st.title("KYC AIO")
+st.subheader(
+    "All-in-one stop for performing multiple checks before you sell high-risk materials to other parties"
+)
+st.write("Use the navigation bar to perform a check")
