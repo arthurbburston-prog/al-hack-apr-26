@@ -1,11 +1,11 @@
+import re
 import streamlit as st
 import requests
 import json
-import time
-from urllib.parse import urlparse, quote
-from typing import Dict, List, Optional, Any
+from urllib.parse import quote
+from typing import Dict, List, Optional
 from datetime import datetime
-import openai  # Add OpenAI for LLM agent
+import openai
 
 
 # ── API Configuration ──────────────────────────────────────────────────────
@@ -86,36 +86,170 @@ def query_orcid(orcid: str) -> Optional[Dict]:
         return None
 
 
-def query_openalex(name: str) -> Optional[Dict]:
-    """Query OpenAlex for author information."""
-    try:
-        url = f"https://api.openalex.org/authors?search={quote(name)}"
-        response = requests.get(url, timeout=API_TIMEOUT)
-        response.raise_for_status()
+def score_openalex_result(result: Dict, institution: str = "", email: str = "") -> float:
+    """Score how well an OpenAlex result matches the expected profile."""
+    score = 0.0
 
-        data = response.json()
-        if data.get("results"):
-            return {
-                "source": "OpenAlex",
-                "data": data,
-                "url": url,
-                "timestamp": datetime.now().isoformat()
-            }
-    except Exception:
-        pass
+    # Affiliation match (40 points max)
+    affiliations = []
+    for aff in result.get("affiliations", []):
+        if isinstance(aff, dict) and aff.get("institution"):
+            aff_name = aff["institution"].get("display_name", "")
+            if aff_name:
+                affiliations.append(aff_name)
+
+    if institution and affiliations:
+        # Exact match gets full points
+        if any(institution.lower() == aff.lower() for aff in affiliations):
+            score += 40
+        # Partial match gets partial points
+        elif any(institution.lower() in aff.lower() for aff in affiliations):
+            score += 25
+        # Related institution (university, research institute) gets some points
+        elif any(word in " ".join(affiliations).lower() for word in ["university", "college", "institute", "laboratory", "center"]):
+            score += 15
+
+    # Email domain match (20 points)
+    if email and "@" in email:
+        domain = email.split("@")[1].lower()
+        # Check if domain appears in any affiliation
+        if any(domain in aff.lower() for aff in affiliations):
+            score += 20
+        # Academic domains get bonus points
+        elif domain in ["edu", "ac.uk", "ac.nz", "ac.au"] and affiliations:
+            score += 10
+
+    # Publication count (20 points max)
+    works_count = result.get("works_count", 0)
+    if works_count >= 100:
+        score += 20
+    elif works_count >= 50:
+        score += 15
+    elif works_count >= 20:
+        score += 10
+    elif works_count >= 5:
+        score += 5
+
+    # Citation impact (20 points max)
+    cited_count = result.get("cited_by_count", 0)
+    if cited_count >= 10000:
+        score += 20
+    elif cited_count >= 1000:
+        score += 15
+    elif cited_count >= 100:
+        score += 10
+    elif cited_count >= 10:
+        score += 5
+
+    return score
+
+
+def query_openalex(name: str, institution: str = "", email: str = "", field: str = "") -> Optional[Dict]:
+    """Query OpenAlex for author information with intelligent result ranking."""
+    try:
+        # Try multiple search strategies for better disambiguation
+        search_strategies = []
+
+        # Most specific first: name + institution
+        if institution:
+            search_strategies.append(f'"{name}" {institution}')
+
+        # Name + field
+        if field:
+            search_strategies.append(f'"{name}" {field}')
+
+        # Name + email domain
+        if email and "@" in email:
+            domain = email.split("@")[1]
+            search_strategies.append(f'"{name}" {domain}')
+
+        # Fallback: just quoted name
+        search_strategies.append(f'"{name}"')
+
+        all_results = []
+
+        # Try each search strategy
+        for search_term in search_strategies:
+            url = f"https://api.openalex.org/authors?search={quote(search_term)}&per_page=10"
+            response = requests.get(url, timeout=API_TIMEOUT)
+            response.raise_for_status()
+
+            data = response.json()
+            results = data.get("results", [])
+
+            # Score each result
+            for result in results:
+                score = score_openalex_result(result, institution, email)
+                result["_relevance_score"] = score
+                result["_search_term"] = search_term
+                all_results.append(result)
+
+        if not all_results:
+            return None
+
+        # Sort by relevance score and get the best match
+        all_results.sort(key=lambda x: x.get("_relevance_score", 0), reverse=True)
+        best_result = all_results[0]
+
+        # Check for collision (multiple good candidates)
+        good_candidates = [r for r in all_results if r.get("_relevance_score", 0) >= 20]  # Candidates with decent scores
+
+        # Extract affiliation names for the result
+        affiliations = []
+        for aff in best_result.get("affiliations", []):
+            if isinstance(aff, dict) and aff.get("institution"):
+                aff_name = aff["institution"].get("display_name", "")
+                if aff_name:
+                    affiliations.append(aff_name)
+
+        result_data = {
+            "source": "OpenAlex",
+            "data": {
+                "author_info": best_result,
+                "total_results": len(all_results),
+                "best_score": best_result.get("_relevance_score", 0),
+                "search_term_used": best_result.get("_search_term", ""),
+                "works_count": best_result.get("works_count", 0),
+                "cited_by_count": best_result.get("cited_by_count", 0),
+                "affiliations": affiliations,
+                "all_candidates": len(good_candidates),
+                "collision_candidates": good_candidates[:5] if len(good_candidates) > 2 else []  # Top 5 for UI
+            },
+            "url": f"https://api.openalex.org/authors?search={quote(best_result.get('_search_term', name))}",
+            "timestamp": datetime.now().isoformat()
+        }
+
+        return result_data
+
+    except Exception as e:
+        st.warning(f"OpenAlex query failed: {str(e)}")
     return None
 
 
 def query_pubmed(name: str, field: str = "") -> Optional[Dict]:
     """Query PubMed for publications."""
     try:
-        # First search for author
+        # First search for author with better search terms
+        search_terms = [f"{name}[Author]"]
+        if field:
+            # Add field-specific terms if provided
+            field_terms = {
+                "medical": "medicine[MeSH] OR clinical[TIAB]",
+                "research": "research[TIAB]",
+                "academic": "university[AD] OR college[AD]",
+            }
+            if field.lower() in field_terms:
+                search_terms.append(field_terms[field.lower()])
+
+        search_query = " AND ".join(search_terms)
+
         search_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
         search_params = {
             "db": "pubmed",
-            "term": f"{name}[Author]",
-            "retmax": "3",
-            "retmode": "json"
+            "term": search_query,
+            "retmax": "5",  # Get more results
+            "retmode": "json",
+            "sort": "relevance"
         }
 
         search_response = requests.get(search_url, params=search_params, timeout=API_TIMEOUT)
@@ -126,11 +260,11 @@ def query_pubmed(name: str, field: str = "") -> Optional[Dict]:
         if not pmids:
             return None
 
-        # Get abstracts for top 3 results
+        # Get detailed summaries for top results
         summary_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
         summary_params = {
             "db": "pubmed",
-            "id": ",".join(pmids[:3]),
+            "id": ",".join(pmids[:3]),  # Top 3
             "retmode": "json"
         }
 
@@ -138,33 +272,79 @@ def query_pubmed(name: str, field: str = "") -> Optional[Dict]:
         summary_response.raise_for_status()
         summary_data = summary_response.json()
 
+        # Extract useful publication info
+        publications = []
+        uids = summary_data.get("result", {}).get("uids", [])
+        for uid in uids:
+            pub_data = summary_data.get("result", {}).get(uid, {})
+            publications.append({
+                "title": pub_data.get("title", ""),
+                "journal": pub_data.get("source", ""),
+                "pub_date": pub_data.get("pubdate", ""),
+                "authors": pub_data.get("authors", [])
+            })
+
         return {
             "source": "PubMed",
-            "data": summary_data,
+            "data": {
+                "total_found": len(pmids),
+                "publications": publications,
+                "search_query": search_query
+            },
             "url": search_url,
             "timestamp": datetime.now().isoformat()
         }
-    except Exception:
+    except Exception as e:
+        st.warning(f"PubMed query failed: {str(e)}")
         return None
 
 
 def query_google_scholar(name: str) -> Optional[Dict]:
-    """Query Google Scholar via web search (simplified)."""
+    """Query Google Scholar via Google Custom Search API or web search."""
     try:
-        # This is a simplified implementation - in production you'd want proper Google Scholar API
-        # For now, we'll simulate with a web search
-        search_term = f'"{name}" site:scholar.google.com'
-        url = f"https://www.google.com/search?q={quote(search_term)}"
+        # Try Google Custom Search API first (if configured)
+        custom_search_key = _get_api_key("GOOGLE_CUSTOM_SEARCH_KEY")
+        custom_search_cx = _get_api_key("GOOGLE_CUSTOM_SEARCH_CX")
 
-        # Note: This would require proper scraping or Google Custom Search API
-        # For demo purposes, we'll return a placeholder
-        return {
-            "source": "Google Scholar",
-            "data": {"note": "Google Scholar search would require API key or scraping implementation"},
-            "url": url,
-            "timestamp": datetime.now().isoformat()
-        }
-    except Exception:
+        if custom_search_key and custom_search_cx:
+            # Use Google Custom Search API
+            search_url = "https://www.googleapis.com/customsearch/v1"
+            params = {
+                "key": custom_search_key,
+                "cx": custom_search_cx,
+                "q": f'"{name}" site:scholar.google.com',
+                "num": 3
+            }
+
+            response = requests.get(search_url, params=params, timeout=API_TIMEOUT)
+            response.raise_for_status()
+            data = response.json()
+
+            items = data.get("items", [])
+            if items:
+                publications = []
+                for item in items[:3]:
+                    publications.append({
+                        "title": item.get("title", ""),
+                        "link": item.get("link", ""),
+                        "snippet": item.get("snippet", "")
+                    })
+
+                return {
+                    "source": "Google Scholar",
+                    "data": {
+                        "total_results": len(items),
+                        "publications": publications,
+                        "method": "Google Custom Search API"
+                    },
+                    "url": search_url,
+                    "timestamp": datetime.now().isoformat()
+                }
+
+        return None
+
+    except Exception as e:
+        st.warning(f"Google Scholar query failed: {str(e)}")
         return None
 
 
@@ -175,48 +355,87 @@ def query_opencorporates(company: str) -> Optional[Dict]:
 
     try:
         api_key = _get_api_key("OPENCORPORATES_API_KEY")
-        url = f"https://api.opencorporates.com/v0.4/companies/search"
-        params = {"q": company}
-        if api_key:
-            params["api_token"] = api_key
+        url = "https://api.opencorporates.com/v0.4/companies/search"
 
-        response = requests.get(url, params=params, timeout=API_TIMEOUT)
-        response.raise_for_status()
-
-        data = response.json()
-        if data.get("results", {}).get("companies"):
+        # OpenCorporates now requires API key for all searches
+        if not api_key:
             return {
                 "source": "OpenCorporates",
-                "data": data,
+                "data": {
+                    "error": "OpenCorporates API key required",
+                    "note": "Set OPENCORPORATES_API_KEY in secrets.toml to enable company verification"
+                },
                 "url": url,
                 "timestamp": datetime.now().isoformat()
             }
-    except Exception:
-        pass
-    return None
 
+        # Try different search variations
+        search_terms = [
+            company,  # Exact match
+            f'"{company}"',  # Quoted exact match
+            company.replace(" ", "+")  # Space to plus
+        ]
 
-def query_web_search(name: str, institution: str = "", field: str = "") -> Optional[Dict]:
-    """Perform web search for professional footprint."""
-    try:
-        # Simplified web search - in production use proper search API
-        search_terms = [name]
-        if institution:
-            search_terms.append(institution)
-        if field:
-            search_terms.append(field)
+        for search_term in search_terms:
+            params = {"q": search_term, "per_page": "3", "api_token": api_key}
 
-        search_query = " ".join(search_terms)
-        url = f"https://www.google.com/search?q={quote(search_query)}"
+            response = requests.get(url, params=params, timeout=API_TIMEOUT)
+            response.raise_for_status()
 
+            data = response.json()
+            companies = data.get("results", {}).get("companies", [])
+
+            if companies:
+                # Get the most relevant company
+                top_company = companies[0]
+                company_data = {
+                    "name": top_company.get("company", {}).get("name", ""),
+                    "jurisdiction": top_company.get("company", {}).get("jurisdiction_code", ""),
+                    "incorporation_date": top_company.get("company", {}).get("incorporation_date", ""),
+                    "status": top_company.get("company", {}).get("current_status", ""),
+                    "officers": [officer.get("name") for officer in top_company.get("company", {}).get("officers", []) if officer.get("name")]
+                }
+
+                return {
+                    "source": "OpenCorporates",
+                    "data": {
+                        "total_found": len(companies),
+                        "top_company": company_data,
+                        "search_term": search_term
+                    },
+                    "url": url,
+                    "timestamp": datetime.now().isoformat()
+                }
+
+        # If no results found with any search term
         return {
-            "source": "Web Search",
-            "data": {"note": "Web search would require search API implementation"},
+            "source": "OpenCorporates",
+            "data": {
+                "total_found": 0,
+                "note": f"No companies found matching '{company}'"
+            },
             "url": url,
             "timestamp": datetime.now().isoformat()
         }
-    except Exception:
+
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code == 401:
+            return {
+                "source": "OpenCorporates",
+                "data": {
+                    "error": "Invalid API key",
+                    "note": "Check your OPENCORPORATES_API_KEY in secrets.toml"
+                },
+                "url": url,
+                "timestamp": datetime.now().isoformat()
+            }
+        else:
+            st.warning(f"OpenCorporates HTTP error: {str(e)}")
+            return None
+    except Exception as e:
+        st.warning(f"OpenCorporates query failed: {str(e)}")
         return None
+
 
 
 # ── LLM Agent Function ─────────────────────────────────────────────────────
@@ -229,19 +448,24 @@ def call_llm_agent(
     company: str = "",
     orcid: str = "",
     use_case: str = "",
-    api_results: List[Dict] = []
+    api_results: Optional[List[Dict]] = None
 ) -> Optional[Dict]:
     """
     Call LLM agent for enhanced analysis when API confidence is low.
 
     Returns the LLM's JSON response or None if failed.
     """
+    api_results = api_results or []
     openai_key = _get_api_key("OPENAI_API_KEY")
     if not openai_key:
         return None
 
     try:
-        client = openai.OpenAI(api_key=openai_key)
+        # Use OpenRouter (OpenAI-compatible API)
+        client = openai.OpenAI(
+            api_key=openai_key,
+            base_url="https://openrouter.ai/api/v1"
+        )
 
         # Prepare input data for LLM
         input_data = {
@@ -278,7 +502,7 @@ Based on the above input data and API query results, analyze the professional fo
 """
 
         response = client.chat.completions.create(
-            model="gpt-4o-mini",  # Using cost-effective model
+            model="openai/gpt-4o-mini",  # Using OpenRouter with GPT-4o-mini
             messages=[
                 {"role": "system", "content": PROFESSIONAL_FOOTPRINT_SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt}
@@ -287,8 +511,9 @@ Based on the above input data and API query results, analyze the professional fo
             max_tokens=2000
         )
 
-        # Parse the JSON response
+        # Parse the JSON response, stripping any markdown code fences
         llm_response = response.choices[0].message.content.strip()
+        llm_response = re.sub(r"^```(?:json)?\s*|\s*```$", "", llm_response, flags=re.IGNORECASE).strip()
 
         # Try to parse as JSON
         try:
@@ -340,73 +565,174 @@ def analyze_affiliation_confirmed(name: str, email: str, institution: str, compa
 
 def analyze_role_consistent(name: str, use_case: str, sources: List[Dict]) -> Optional[bool]:
     """Determine if role is consistent with use case."""
-    # Extract field from use case (simplified)
-    field_keywords = ["research", "academic", "medical", "engineering", "science", "clinical"]
+    if not use_case:
+        return None
 
-    use_case_field = None
-    for keyword in field_keywords:
-        if keyword in use_case.lower():
-            use_case_field = keyword
-            break
+    # Extract field keywords from use case
+    use_case_lower = use_case.lower()
+    field_keywords = {
+        "academic": ["research", "university", "professor", "student", "phd", "thesis", "academic", "scholar"],
+        "medical": ["medical", "clinical", "patient", "health", "disease", "treatment", "drug", "therapy"],
+        "technology": ["software", "computer", "ai", "machine learning", "data", "algorithm", "tech"],
+        "engineering": ["engineer", "design", "manufacturing", "material", "device", "system"],
+        "business": ["business", "company", "corporate", "management", "executive", "ceo"],
+        "science": ["physics", "chemistry", "biology", "experiment", "laboratory", "scientific"]
+    }
 
-    if not use_case_field:
-        return None  # Cannot determine
+    # Determine primary field from use case
+    primary_field = None
+    max_matches = 0
+    for field, keywords in field_keywords.items():
+        matches = sum(1 for keyword in keywords if keyword in use_case_lower)
+        if matches > max_matches:
+            max_matches = matches
+            primary_field = field
 
-    # Check sources for consistency
-    publications_found = False
+    if not primary_field:
+        return None  # Can't determine field
+
+    # Check if sources support this field
+    field_evidence = False
+
+    # Check OpenAlex for academic/research publications
     for source in sources:
-        if source and source.get("source") in ["PubMed", "OpenAlex", "Google Scholar"]:
-            data_str = json.dumps(source.get("data", {}))
-            if use_case_field in data_str.lower():
-                publications_found = True
-                break
+        if source and source.get("source") == "OpenAlex":
+            data = source.get("data", {})
+            works_count = data.get("works_count", 0)
+            cited_count = data.get("cited_by_count", 0)
 
-    return publications_found if publications_found else None
+            # Academic/research evidence
+            if primary_field in ["academic", "science", "medical"] and works_count > 0:
+                field_evidence = True
+            elif primary_field == "technology" and (works_count > 0 or cited_count > 100):
+                field_evidence = True
+
+        elif source and source.get("source") == "PubMed":
+            data = source.get("data", {})
+            total_found = data.get("total_found", 0)
+            if total_found > 0:
+                # Medical/academic publications found
+                if primary_field in ["medical", "academic", "science"]:
+                    field_evidence = True
+
+        elif source and source.get("source") == "OpenCorporates":
+            data = source.get("data", {})
+            if "total_found" in data and data["total_found"] > 0:
+                # Company found - good for business/technology roles
+                if primary_field in ["business", "technology", "engineering"]:
+                    field_evidence = True
+
+    return True if field_evidence else None
 
 
 def generate_flags(name: str, email: str, institution: str, company: str, sources: List[Dict]) -> List[str]:
     """Generate flags based on analysis."""
     flags = []
 
-    # Check for name collisions (simplified - check if multiple results)
-    openalex_results = [s for s in sources if s and s.get("source") == "OpenAlex"]
-    if openalex_results and len(openalex_results[0].get("data", {}).get("results", [])) > 3:
-        flags.append("name_collision")
+    # Check for name collisions using the new candidate data
+    for source in sources:
+        if source and source.get("source") == "OpenAlex":
+            all_candidates = source.get("data", {}).get("all_candidates", 1)
+            if all_candidates > 2:
+                flags.append("name_collision")
+            break
 
-    # Check institution/company not found
+    # Check institution/company not found - be more lenient
     affiliation_found = False
     for source in sources:
-        if source and source.get("source") in ["OpenAlex", "Web Search"]:
-            data_str = json.dumps(source.get("data", {}))
-            if (institution and institution.lower() in data_str.lower()) or \
-               (company and company.lower() in data_str.lower()):
+        if source and source.get("source") == "OpenAlex":
+            data_str = json.dumps(source.get("data", {})).lower()
+            # More flexible matching - check for partial matches
+            if institution and any(word in data_str for word in institution.lower().split()):
+                affiliation_found = True
+                break
+            if company and any(word in data_str for word in company.lower().split()):
                 affiliation_found = True
                 break
 
     if not affiliation_found and (institution or company):
         flags.append("institution_not_found")
 
-    # Email domain mismatch
-    email_domain = email.split("@")[1] if "@" in email else ""
-    if institution and email_domain not in institution.lower().replace(" ", ""):
-        flags.append("email_domain_mismatch")
+    # Email domain mismatch - be more intelligent
+    if email and "@" in email:
+        email_domain = email.split("@")[1].lower()
+        # Check for common institutional patterns
+        institutional_patterns = [".edu", ".ac.", ".gov", ".org", ".com"]
+        is_institutional_email = any(pattern in email_domain for pattern in institutional_patterns)
+
+        # Only flag if we have an institution but email doesn't seem institutional
+        if institution and not is_institutional_email:
+            # Allow some common mismatches (e.g., research institutes)
+            common_research_domains = ["nih.gov", "cdc.gov", "who.int", "un.org"]
+            if email_domain not in common_research_domains:
+                flags.append("email_domain_mismatch")
 
     return flags
 
 
 def generate_evidence(sources: List[Dict]) -> List[Dict]:
-    """Generate evidence list from sources."""
+    """Generate evidence list from sources with meaningful excerpts."""
     evidence = []
 
     for source in sources:
-        if source:
-            # Extract excerpt (simplified - just take a sample)
-            data_str = json.dumps(source.get("data", {}))[:200] + "..."
+        if not source:
+            continue
 
+        source_name = source.get("source", "")
+        data = source.get("data", {})
+        url = source.get("url", "")
+        timestamp = source.get("timestamp", "")
+
+        excerpt = ""
+
+        if source_name == "OpenAlex":
+            works_count = data.get("works_count", 0)
+            cited_count = data.get("cited_by_count", 0)
+            affiliations = data.get("affiliations", [])
+
+            excerpt = f"Found author with {works_count} publications"
+            if cited_count > 0:
+                excerpt += f" and {cited_count} citations"
+            if affiliations:
+                excerpt += f". Affiliated with: {', '.join(affiliations[:2])}"
+
+        elif source_name == "PubMed":
+            total_found = data.get("total_found", 0)
+            publications = data.get("publications", [])
+
+            if total_found > 0:
+                excerpt = f"Found {total_found} publications in PubMed"
+                if publications:
+                    top_pub = publications[0]
+                    title = top_pub.get("title", "")[:80]
+                    journal = top_pub.get("journal", "")
+                    year = top_pub.get("pub_date", "")[:4]
+                    excerpt += f". Recent work: '{title}...' ({journal}, {year})"
+
+        elif source_name == "Google Scholar":
+            if "error" in data:
+                excerpt = f"Google Scholar search configured but API key needed"
+            else:
+                excerpt = f"Google Scholar search completed for publications"
+
+        elif source_name == "OpenCorporates":
+            if "error" in data:
+                excerpt = f"OpenCorporates API requires key for company verification"
+            else:
+                total_found = data.get("total_found", 0)
+                if total_found > 0:
+                    top_company = data.get("top_company", {})
+                    name = top_company.get("name", "")
+                    status = top_company.get("status", "")
+                    excerpt = f"Found company '{name}' (Status: {status})"
+                else:
+                    excerpt = f"No companies found matching search criteria"
+
+        if excerpt:
             evidence.append({
-                "source_url": source.get("url", ""),
-                "excerpt": f"Data from {source.get('source')}: {data_str}",
-                "date": source.get("timestamp", "")
+                "source_url": url,
+                "excerpt": excerpt,
+                "date": timestamp
             })
 
     return evidence
@@ -420,7 +746,8 @@ def perform_professional_footprint_check(
     linkedin_url: str = "",
     institution: str = "",
     company: str = "",
-    use_case: str = ""
+    use_case: str = "",
+    selected_candidate: Optional[Dict] = None
 ) -> Dict:
     """Perform the professional footprint verification check."""
 
@@ -432,9 +759,36 @@ def perform_professional_footprint_check(
 
     # 1. ORCID (skipped - not in input)
     # 2. OpenAlex
-    openalex_result = query_openalex(name)
-    if openalex_result:
+    if selected_candidate:
+        # Use the user-selected candidate
+        affiliations = []
+        for aff in selected_candidate.get("affiliations", []):
+            if isinstance(aff, dict) and aff.get("institution"):
+                aff_name = aff["institution"].get("display_name", "")
+                if aff_name:
+                    affiliations.append(aff_name)
+
+        openalex_result = {
+            "source": "OpenAlex",
+            "data": {
+                "author_info": selected_candidate,
+                "total_results": 1,
+                "best_score": selected_candidate.get("_relevance_score", 0),
+                "search_term_used": "User selected",
+                "works_count": selected_candidate.get("works_count", 0),
+                "cited_by_count": selected_candidate.get("cited_by_count", 0),
+                "affiliations": affiliations,
+                "all_candidates": 1,
+                "collision_candidates": []
+            },
+            "url": f"https://api.openalex.org/authors?search={quote(name)}",
+            "timestamp": datetime.now().isoformat()
+        }
         sources.append(openalex_result)
+    else:
+        openalex_result = query_openalex(name, institution, email, use_case.split()[0] if use_case else "")
+        if openalex_result:
+            sources.append(openalex_result)
 
     # 3. PubMed
     pubmed_result = query_pubmed(name)
@@ -452,22 +806,63 @@ def perform_professional_footprint_check(
         if opencorp_result:
             sources.append(opencorp_result)
 
-    # 6. Web search
-    web_result = query_web_search(name, institution or company)
-    if web_result:
-        sources.append(web_result)
-
     # Analyze results
     affiliation_confirmed = analyze_affiliation_confirmed(name, email, institution, company, sources)
     role_consistent = analyze_role_consistent(name, use_case, sources)
     flags = generate_flags(name, email, institution, company, sources)
     evidence = generate_evidence(sources)
 
-    # Determine confidence
-    if not flags and affiliation_confirmed:
+    # Determine confidence with more nuanced logic
+    confidence_score = 0
+
+    # Affiliation confirmed is worth 40 points
+    if affiliation_confirmed:
+        confidence_score += 40
+
+    # Role consistency is worth 30 points
+    if role_consistent is True:
+        confidence_score += 30
+    elif role_consistent is None:
+        confidence_score += 10  # Some benefit for having sources to check
+
+    # Evidence quality - 20 points max
+    evidence_sources = len([e for e in evidence if e.get("excerpt", "") != ""])
+    confidence_score += min(evidence_sources * 5, 20)
+
+    # Penalties for flags
+    serious_flags = ["name_collision", "person_not_found_at_institution"]
+    minor_flags = ["email_domain_mismatch", "institution_not_found"]
+
+    for flag in flags:
+        if flag in serious_flags:
+            confidence_score -= 25
+        elif flag in minor_flags:
+            confidence_score -= 10
+
+    # Determine final confidence
+    if confidence_score >= 60:
         confidence = "high"
     else:
         confidence = "low"
+
+    # Generate summary (needed for both paths)
+    summary_parts = []
+    if affiliation_confirmed:
+        summary_parts.append("Professional affiliation confirmed")
+    else:
+        summary_parts.append("Professional affiliation not confirmed")
+
+    if role_consistent is True:
+        summary_parts.append("and role appears consistent with stated use case")
+    elif role_consistent is False:
+        summary_parts.append("but role consistency unclear")
+    else:
+        summary_parts.append("and role consistency could not be determined")
+
+    if flags:
+        summary_parts.append(f"({', '.join(flags)})")
+
+    summary = ". ".join(summary_parts)
 
     # If confidence is low, try LLM agent for enhanced analysis
     if confidence == "low":
@@ -499,30 +894,12 @@ def perform_professional_footprint_check(
                     "summary": f"{summary} (LLM analysis: {llm_result.get('summary', '')})",
                     "cost_usd": 0.0,  # Would calculate actual costs
                     "llm_enhanced": True,
-                    "llm_insights": llm_result
+                    "llm_insights": llm_result,
+                    "sources": sources  # Include sources for collision detection
                 }
                 return result
 
-    # Generate summary
-    summary_parts = []
-    if affiliation_confirmed:
-        summary_parts.append("Professional affiliation confirmed")
-    else:
-        summary_parts.append("Professional affiliation not confirmed")
-
-    if role_consistent is True:
-        summary_parts.append("and role appears consistent with stated use case")
-    elif role_consistent is False:
-        summary_parts.append("but role consistency unclear")
-    else:
-        summary_parts.append("and role consistency could not be determined")
-
-    if flags:
-        summary_parts.append(f"({', '.join(flags)})")
-
-    summary = ". ".join(summary_parts)
-
-    # Build result
+    # Build result (for high confidence or when LLM doesn't improve)
     result = {
         "confidence": confidence,
         "affiliation_confirmed": affiliation_confirmed,
@@ -530,7 +907,8 @@ def perform_professional_footprint_check(
         "evidence": evidence,
         "flags": flags,
         "summary": summary,
-        "cost_usd": 0.0  # Placeholder - would calculate based on API usage
+        "cost_usd": 0.0,  # Placeholder - would calculate based on API usage
+        "sources": sources  # Include sources for collision detection
     }
 
     return result
@@ -546,6 +924,14 @@ def main():
     This check analyzes a person's publicly visible professional footprint to determine
     if their stated use case is plausibly consistent with their background.
     """)
+
+    # Initialize session state for collision handling
+    if "collision_candidates" not in st.session_state:
+        st.session_state.collision_candidates = None
+    if "selected_candidate" not in st.session_state:
+        st.session_state.selected_candidate = None
+    if "original_inputs" not in st.session_state:
+        st.session_state.original_inputs = None
 
     # Input form
     with st.form("footprint_check"):
@@ -569,10 +955,54 @@ def main():
 
         submitted = st.form_submit_button("Run Footprint Check")
 
+    # Handle name collision resolution
+    if st.session_state.collision_candidates and not st.session_state.selected_candidate:
+        st.warning("⚠️ Multiple people found with this name. Please select the correct one:")
+
+        candidates = st.session_state.collision_candidates
+        options = ["Skip this source (use other data only)"]
+
+        for i, candidate in enumerate(candidates):
+            affs = candidate.get("affiliations", [])[:2]  # Show top 2 affiliations
+            works = candidate.get("works_count", 0)
+            cited = candidate.get("cited_by_count", 0)
+            score = candidate.get("_relevance_score", 0)
+
+            option_text = f"Option {i+1}: {works} publications, {cited} citations"
+            if affs:
+                option_text += f" - {', '.join(affs)}"
+            option_text += f" (Score: {score:.1f})"
+
+            options.append(option_text)
+
+        selection = st.selectbox("Select the correct person:", options, key="candidate_selection")
+
+        if st.button("Confirm Selection", key="confirm_selection"):
+            if "Skip this source" in selection:
+                st.session_state.selected_candidate = None
+            else:
+                # Extract candidate index from selection
+                selected_idx = int(selection.split()[1]) - 1
+                st.session_state.selected_candidate = candidates[selected_idx]
+
+            st.rerun()
+
+    # Clear collision state if we're starting fresh
+    elif submitted and st.session_state.collision_candidates:
+        st.session_state.collision_candidates = None
+        st.session_state.selected_candidate = None
+        st.session_state.original_inputs = None
+
     if submitted:
         if not name or not email or not use_case:
             st.error("Please provide name, email, and use case.")
             return
+
+        # Store inputs for potential re-run
+        st.session_state.original_inputs = {
+            "name": name, "email": email, "linkedin_url": linkedin_url,
+            "institution": institution, "company": company, "use_case": use_case
+        }
 
         with st.spinner("Analyzing professional footprint across multiple sources..."):
             try:
@@ -582,21 +1012,71 @@ def main():
                     linkedin_url=linkedin_url,
                     institution=institution,
                     company=company,
-                    use_case=use_case
+                    use_case=use_case,
+                    selected_candidate=st.session_state.selected_candidate
                 )
 
-                # Display raw JSON result
-                st.success("Analysis Complete")
-                st.json(result)
+                # Check for name collision and prompt user if needed
+                openalex_data = None
+                for source in result.get("sources", []):
+                    if source and source.get("source") == "OpenAlex":
+                        openalex_data = source.get("data", {})
+                        break
 
-                # Show confidence indicator
-                if result["confidence"] == "high":
-                    st.success("🎉 High confidence verification")
-                else:
-                    st.warning("⚠️ Low confidence - review flags and evidence")
+                if openalex_data and openalex_data.get("all_candidates", 1) > 2 and not st.session_state.selected_candidate:
+                    # Name collision detected - store candidates for user selection
+                    collision_candidates = openalex_data.get("collision_candidates", [])
+                    if collision_candidates:
+                        st.session_state.collision_candidates = collision_candidates
+                        st.info("🔄 Name collision detected. Please select the correct candidate above.")
+                        return
+
+                # Display results
+                st.success("Analysis Complete")
+                display_results(result)
 
             except Exception as e:
                 st.error(f"Error during analysis: {str(e)}")
+
+
+def display_results(result: Dict):
+    """Display the verification results in a user-friendly format."""
+    # Show confidence indicator
+    if result["confidence"] == "high":
+        st.success("🎉 High confidence verification")
+    else:
+        st.warning("⚠️ Low confidence - review flags and evidence")
+
+    # Show summary
+    st.subheader("Summary")
+    st.write(result.get("summary", "No summary available"))
+
+    # Show flags if any
+    flags = result.get("flags", [])
+    if flags:
+        st.subheader("⚠️ Flags")
+        for flag in flags:
+            if flag == "name_collision":
+                st.warning("• Name collision: Multiple people with this name found")
+            elif flag == "institution_not_found":
+                st.warning("• Institution not found in available data")
+            elif flag == "email_domain_mismatch":
+                st.warning("• Email domain doesn't match expected institutional pattern")
+            else:
+                st.warning(f"• {flag}")
+
+    # Show evidence
+    evidence = result.get("evidence", [])
+    if evidence:
+        st.subheader("📋 Evidence")
+        for item in evidence:
+            with st.expander(f"Source: {item.get('source_url', 'Unknown')}"):
+                st.write(f"**Excerpt:** {item.get('excerpt', 'No excerpt')}")
+                st.write(f"**Date:** {item.get('date', 'Unknown')}")
+
+    # Show raw JSON for debugging
+    with st.expander("🔧 Raw Results (for debugging)"):
+        st.json(result)
 
 
 if __name__ == "__main__":

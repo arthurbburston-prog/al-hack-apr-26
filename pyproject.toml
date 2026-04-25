@@ -1,7 +1,7 @@
 [project]
 name = "al-hack-apr-26"
 version = "0.1.0"
-description = "Add your description here"
+description = "KYC all-in-one: multi-source professional footprint and institution verification checks"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
