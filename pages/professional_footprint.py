@@ -5,6 +5,7 @@ import time
 from urllib.parse import urlparse, quote
 from typing import Dict, List, Optional, Any
 from datetime import datetime
+import openai  # Add OpenAI for LLM agent
 
 
 # ── API Configuration ──────────────────────────────────────────────────────
@@ -17,6 +18,48 @@ def _get_api_key(key: str) -> Optional[str]:
         return st.secrets[key]
     except KeyError:
         return None
+
+
+# ── LLM Agent System Prompt ────────────────────────────────────────────────
+
+PROFESSIONAL_FOOTPRINT_SYSTEM_PROMPT = """
+the excerpt must describe only information explicitly present at the source_url — do not summarise what you inferred or expected to find.
+
+Professional Footprint Verification Agent
+You are a consistency checker, not a fraud detector. Determine whether a person's publicly visible professional or research footprint is plausibly consistent with their stated use case. Return a single JSON object only — no prose outside it.
+
+INPUT FIELDS
+name, email (required)
+linkedin_url, institution, company, orcid (optional)
+use_case 2–4 sentences of intended product use (required)
+OUTPUT SCHEMA
+confidence: "high" | "low"
+affiliation_confirmed: boolean
+role_consistent: boolean | null
+evidence: [{ source_url, excerpt, date }]
+flags: string[]
+summary: string (one sentence)
+cost_usd: number
+
+Sources — query in order, stop when confidence is high and flags are resolved
+• ORCID — pub.orcid.org/v3.0/{orcid}/record — confirm name, affiliation, works
+• OpenAlex — api.openalex.org/authors?search={name} — publication history and institution
+• PubMed — eutils.ncbi.nlm.nih.gov esearch — top 3 abstracts for field relevance
+• Google Scholar — web search for scholar.google.com profile — titles and citation count only
+• OpenCorporates — api.opencorporates.com/v0.4/companies/search — existence, date, officers
+• Web search — name + institution + field — prefer .edu / .ac.uk / .gov / society domains
+
+Flag Vocabulary — use only these tokens, never invent new ones
+name_collision | institution_not_found | person_not_found_at_institution | no_publication_history_consistent_with_role | company_recently_incorporated | email_domain_mismatch | orcid_name_mismatch | linkedin_profile_sparse | use_case_field_mismatch | conflicting_employer_signals
+
+Hard Rules
+• Absence ≠ malice — never set role_consistent to false solely because evidence is absent — use null
+• No fabrication — if a query returns nothing, record no evidence for that source
+• name_collision → low — when two individuals share the same name and attribution is ambiguous, confidence must be "low"
+• Affiliation threshold — do not set affiliation_confirmed to true on email domain alone — require a primary source
+• Summary language — plain English for a non-technical reviewer; never use the word "suspicious"
+• Valid JSON only — null for missing strings, [] for missing arrays — never omit a required field
+"""
 
 
 # ── API Query Functions ────────────────────────────────────────────────────
@@ -173,6 +216,92 @@ def query_web_search(name: str, institution: str = "", field: str = "") -> Optio
             "timestamp": datetime.now().isoformat()
         }
     except Exception:
+        return None
+
+
+# ── LLM Agent Function ─────────────────────────────────────────────────────
+
+def call_llm_agent(
+    name: str,
+    email: str,
+    linkedin_url: str = "",
+    institution: str = "",
+    company: str = "",
+    orcid: str = "",
+    use_case: str = "",
+    api_results: List[Dict] = []
+) -> Optional[Dict]:
+    """
+    Call LLM agent for enhanced analysis when API confidence is low.
+
+    Returns the LLM's JSON response or None if failed.
+    """
+    openai_key = _get_api_key("OPENAI_API_KEY")
+    if not openai_key:
+        return None
+
+    try:
+        client = openai.OpenAI(api_key=openai_key)
+
+        # Prepare input data for LLM
+        input_data = {
+            "name": name,
+            "email": email,
+            "use_case": use_case
+        }
+
+        if linkedin_url:
+            input_data["linkedin_url"] = linkedin_url
+        if institution:
+            input_data["institution"] = institution
+        if company:
+            input_data["company"] = company
+        if orcid:
+            input_data["orcid"] = orcid
+
+        # Include API results as context
+        context = "API QUERY RESULTS:\n"
+        for result in api_results:
+            if result:
+                context += f"\n{result['source']}:\n"
+                context += f"URL: {result['url']}\n"
+                context += f"Data: {json.dumps(result['data'], indent=2)}\n"
+                context += f"Timestamp: {result['timestamp']}\n"
+
+        user_prompt = f"""
+INPUT DATA:
+{json.dumps(input_data, indent=2)}
+
+{context}
+
+Based on the above input data and API query results, analyze the professional footprint and return the JSON response.
+"""
+
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",  # Using cost-effective model
+            messages=[
+                {"role": "system", "content": PROFESSIONAL_FOOTPRINT_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.1,  # Low temperature for consistent analysis
+            max_tokens=2000
+        )
+
+        # Parse the JSON response
+        llm_response = response.choices[0].message.content.strip()
+
+        # Try to parse as JSON
+        try:
+            result = json.loads(llm_response)
+            # Add LLM source indicator
+            result["llm_enhanced"] = True
+            return result
+        except json.JSONDecodeError:
+            st.warning(f"LLM returned invalid JSON: {llm_response[:200]}...")
+            return None
+
+    except Exception as e:
+        st.warning(f"LLM agent failed: {str(e)}")
         return None
 
 
@@ -339,6 +468,40 @@ def perform_professional_footprint_check(
         confidence = "high"
     else:
         confidence = "low"
+
+    # If confidence is low, try LLM agent for enhanced analysis
+    if confidence == "low":
+        st.info("🔄 API confidence is low - calling LLM agent for enhanced analysis...")
+        llm_result = call_llm_agent(
+            name=name,
+            email=email,
+            linkedin_url=linkedin_url,
+            institution=institution,
+            company=company,
+            orcid="",  # Not in input as requested
+            use_case=use_case,
+            api_results=sources
+        )
+
+        if llm_result:
+            # Use LLM result if it provides better confidence
+            if llm_result.get("confidence") == "high":
+                st.success("✅ LLM agent improved confidence to HIGH!")
+                return llm_result
+            else:
+                # Keep API result but add LLM insights
+                result = {
+                    "confidence": confidence,  # Keep API confidence
+                    "affiliation_confirmed": affiliation_confirmed,
+                    "role_consistent": role_consistent,
+                    "evidence": evidence + (llm_result.get("evidence", [])),
+                    "flags": flags + (llm_result.get("flags", [])),
+                    "summary": f"{summary} (LLM analysis: {llm_result.get('summary', '')})",
+                    "cost_usd": 0.0,  # Would calculate actual costs
+                    "llm_enhanced": True,
+                    "llm_insights": llm_result
+                }
+                return result
 
     # Generate summary
     summary_parts = []
