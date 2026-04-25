@@ -1,7 +1,6 @@
 import streamlit as st
 import requests
 import uuid
-import json
 
 st.title("Jumio ID Verification")
 st.subheader("Government ID + Selfie verification via Jumio")
@@ -12,17 +11,23 @@ BASE_URLS = {
     "SGP": "https://retrieval.sgp-1.jumio.ai",
 }
 
+def _secret(key):
+    try:
+        return st.secrets[key]
+    except Exception:
+        return ""
+
 with st.sidebar:
     st.header("Jumio Credentials")
-    api_token = st.text_input(pip
+    api_token = st.text_input(
         "API Token",
         type="password",
-        value=st.secrets.get("JUMIO_API_TOKEN", "") if hasattr(st, "secrets") else "",
+        value=_secret("JUMIO_API_TOKEN"),
     )
     api_secret = st.text_input(
         "API Secret",
         type="password",
-        value=st.secrets.get("JUMIO_API_SECRET", "") if hasattr(st, "secrets") else "",
+        value=_secret("JUMIO_API_SECRET"),
     )
     datacenter = st.selectbox("Datacenter", list(BASE_URLS.keys()))
 
