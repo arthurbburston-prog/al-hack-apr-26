@@ -1097,13 +1097,32 @@ def main():
 
             st.rerun()
 
+    # After collision resolution: re-run analysis with the confirmed candidate
+    if st.session_state.selected_candidate and st.session_state.original_inputs and not submitted:
+        inputs = st.session_state.original_inputs
+        with st.spinner("Analyzing professional footprint for selected candidate..."):
+            try:
+                result = perform_professional_footprint_check(
+                    name=inputs["name"],
+                    email=inputs["email"],
+                    linkedin_url=inputs["linkedin_url"],
+                    institution=inputs["institution"],
+                    company=inputs["company"],
+                    use_case=inputs["use_case"],
+                    selected_candidate=st.session_state.selected_candidate
+                )
+                st.success("Analysis Complete")
+                display_results(result)
+            except Exception as e:
+                st.error(f"Error during analysis: {str(e)}")
+
     if submitted:
         if not name or not email or not use_case:
             st.error("Please provide name, email, and use case.")
             return
 
-        if len(use_case.split()) < 50:
-            st.error("Use case must be a minimum of 50 words.")
+        if len(use_case.split()) < 30:
+            st.error("Use case must be a minimum of 30 words.")
             return
 
         with st.spinner("Checking use case..."):
