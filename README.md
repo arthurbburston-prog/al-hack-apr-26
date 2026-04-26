@@ -6,3 +6,6 @@
 ```bash
 uv run streamlit run main.py
 ```
+
+Hosted at:
+https://al-hack-apr-26-xlzhpdedsj5imnexszpyur.streamlit.app

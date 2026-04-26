@@ -188,28 +188,16 @@ def query_openalex(name: str, institution: str = "", email: str = "", field: str
 
         # Sort by relevance score and get the best match
         all_results.sort(key=lambda x: x.get("_relevance_score", 0), reverse=True)
-
-        _generic = {"with", "and", "for", "the", "university", "college", "institute",
-                    "institution", "laboratory", "center", "centre",
-                    "school", "department", "faculty", "research", "national", "royal"}
-        inst_words = set()
-        if institution:
-            inst_words = {w.lower() for w in institution.split()
-                          if len(w) > 3 and w.lower() not in _generic}
-
-        # When institution is known, prefer a candidate from that institution over
-        # a higher-scoring famous namesake at a different one.
-        if inst_words:
-            institution_matched = [r for r in all_results if _candidate_matches_institution(r, inst_words)]
-            best_result = institution_matched[0] if institution_matched else all_results[0]
-        else:
-            best_result = all_results[0]
+        best_result = all_results[0]
 
         good_candidates = [r for r in all_results if r.get("_relevance_score", 0) >= COLLISION_SCORE_THRESHOLD]
 
-        if inst_words:
-            good_candidates = [c for c in good_candidates
-                               if _candidate_matches_institution(c, inst_words)]
+        if institution:
+            inst_words = {w.lower() for w in institution.split()
+                          if len(w) > 3 and w.lower() not in {"with", "and", "for", "the"}}
+            if inst_words:
+                good_candidates = [c for c in good_candidates
+                                   if _candidate_matches_institution(c, inst_words)]
 
         affiliations = _extract_affiliations(best_result.get("affiliations", []))
 
@@ -650,8 +638,7 @@ def generate_flags(name: str, email: str, institution: str, company: str, source
         if source and source.get("source") == "OpenAlex":
             aff_names = source.get("data", {}).get("affiliations", [])
             aff_str = " ".join(aff_names).lower()
-            sig_words = [w for term in (institution, company) if term
-                         for w in term.lower().split() if len(w) > 3]
+            sig_words = [w for w in (institution or company or "").lower().split() if len(w) > 3]
             if sig_words and any(word in aff_str for word in sig_words):
                 affiliation_found = True
             break
@@ -858,33 +845,53 @@ def perform_professional_footprint_check(
 
     summary = ". ".join(summary_parts)
 
-    # Always call LLM for final consistency assessment
-    st.info("Assessing whether stated purpose is consistent with professional background...")
-    llm_result = call_llm_agent(
-        name=name,
-        email=email,
-        linkedin_url=linkedin_url,
-        institution=institution,
-        company=company,
-        use_case=use_case,
-        api_results=sources
-    )
+    # If confidence is low, try LLM agent for enhanced analysis
+    if confidence == "low":
+        st.info("🔄 API confidence is low - calling LLM agent for enhanced analysis...")
+        llm_result = call_llm_agent(
+            name=name,
+            email=email,
+            linkedin_url=linkedin_url,
+            institution=institution,
+            company=company,
+            use_case=use_case,
+            api_results=sources
+        )
 
-    if llm_result:
-        llm_result["sources"] = sources  # preserve for collision detection
-        return llm_result
+        if llm_result:
+            # Use LLM result if it provides better confidence
+            if llm_result.get("confidence") == "high":
+                st.success("✅ LLM agent improved confidence to HIGH!")
+                return llm_result
+            else:
+                # Keep API result but add LLM insights
+                result = {
+                    "confidence": confidence,  # Keep API confidence
+                    "affiliation_confirmed": affiliation_confirmed,
+                    "role_consistent": role_consistent,
+                    "evidence": evidence + (llm_result.get("evidence", [])),
+                    "flags": list(dict.fromkeys(flags + llm_result.get("flags", []))),
+                    "summary": f"{summary} (LLM analysis: {llm_result.get('summary', '')})",
+                    "cost_usd": 0.0,  # Would calculate actual costs
+                    "llm_enhanced": True,
+                    "llm_insights": llm_result,
+                    "sources": sources  # Include sources for collision detection
+                }
+                return result
 
-    # Fallback to rule-based result if LLM is unavailable
-    return {
+    # Build result (for high confidence or when LLM doesn't improve)
+    result = {
         "confidence": confidence,
         "affiliation_confirmed": affiliation_confirmed,
         "role_consistent": role_consistent,
         "evidence": evidence,
         "flags": flags,
         "summary": summary,
-        "cost_usd": 0.0,
-        "sources": sources
+        "cost_usd": 0.0,  # Placeholder - would calculate based on API usage
+        "sources": sources  # Include sources for collision detection
     }
+
+    return result
 
 
 @st.cache_data(ttl=3600)
@@ -938,7 +945,6 @@ def validate_use_case(use_case: str) -> Dict:
     openai_key = _get_api_key("OPENAI_API_KEY")
 
     if not openai_key:
-        st.warning("OpenAI API key not configured — LLM use-case validation skipped.")
         return {"sufficient": True, "feedback": ""}
 
     try:
@@ -1106,32 +1112,13 @@ def main():
 
             st.rerun()
 
-    # After collision resolution: re-run analysis with the confirmed candidate
-    if st.session_state.selected_candidate and st.session_state.original_inputs and not submitted:
-        inputs = st.session_state.original_inputs
-        with st.spinner("Analyzing professional footprint for selected candidate..."):
-            try:
-                result = perform_professional_footprint_check(
-                    name=inputs["name"],
-                    email=inputs["email"],
-                    linkedin_url=inputs["linkedin_url"],
-                    institution=inputs["institution"],
-                    company=inputs["company"],
-                    use_case=inputs["use_case"],
-                    selected_candidate=st.session_state.selected_candidate
-                )
-                st.success("Analysis Complete")
-                display_results(result)
-            except Exception as e:
-                st.error(f"Error during analysis: {str(e)}")
-
     if submitted:
         if not name or not email or not use_case:
             st.error("Please provide name, email, and use case.")
             return
 
-        if len(use_case.split()) < 30:
-            st.error("Use case must be a minimum of 30 words.")
+        if len(use_case.split()) < 50:
+            st.error("Use case must be a minimum of 50 words.")
             return
 
         with st.spinner("Checking use case..."):
