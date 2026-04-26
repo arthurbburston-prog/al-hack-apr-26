@@ -193,8 +193,11 @@ def query_openalex(name: str, institution: str = "", email: str = "", field: str
         good_candidates = [r for r in all_results if r.get("_relevance_score", 0) >= COLLISION_SCORE_THRESHOLD]
 
         if institution:
+            _generic = {"with", "and", "for", "the", "university", "college", "institute",
+                        "institution", "laboratory", "laboratory", "center", "centre",
+                        "school", "department", "faculty", "research", "national", "royal"}
             inst_words = {w.lower() for w in institution.split()
-                          if len(w) > 3 and w.lower() not in {"with", "and", "for", "the"}}
+                          if len(w) > 3 and w.lower() not in _generic}
             if inst_words:
                 good_candidates = [c for c in good_candidates
                                    if _candidate_matches_institution(c, inst_words)]
@@ -846,53 +849,33 @@ def perform_professional_footprint_check(
 
     summary = ". ".join(summary_parts)
 
-    # If confidence is low, try LLM agent for enhanced analysis
-    if confidence == "low":
-        st.info("🔄 API confidence is low - calling LLM agent for enhanced analysis...")
-        llm_result = call_llm_agent(
-            name=name,
-            email=email,
-            linkedin_url=linkedin_url,
-            institution=institution,
-            company=company,
-            use_case=use_case,
-            api_results=sources
-        )
+    # Always call LLM for final consistency assessment
+    st.info("Assessing whether stated purpose is consistent with professional background...")
+    llm_result = call_llm_agent(
+        name=name,
+        email=email,
+        linkedin_url=linkedin_url,
+        institution=institution,
+        company=company,
+        use_case=use_case,
+        api_results=sources
+    )
 
-        if llm_result:
-            # Use LLM result if it provides better confidence
-            if llm_result.get("confidence") == "high":
-                st.success("✅ LLM agent improved confidence to HIGH!")
-                return llm_result
-            else:
-                # Keep API result but add LLM insights
-                result = {
-                    "confidence": confidence,  # Keep API confidence
-                    "affiliation_confirmed": affiliation_confirmed,
-                    "role_consistent": role_consistent,
-                    "evidence": evidence + (llm_result.get("evidence", [])),
-                    "flags": list(dict.fromkeys(flags + llm_result.get("flags", []))),
-                    "summary": f"{summary} (LLM analysis: {llm_result.get('summary', '')})",
-                    "cost_usd": 0.0,  # Would calculate actual costs
-                    "llm_enhanced": True,
-                    "llm_insights": llm_result,
-                    "sources": sources  # Include sources for collision detection
-                }
-                return result
+    if llm_result:
+        llm_result["sources"] = sources  # preserve for collision detection
+        return llm_result
 
-    # Build result (for high confidence or when LLM doesn't improve)
-    result = {
+    # Fallback to rule-based result if LLM is unavailable
+    return {
         "confidence": confidence,
         "affiliation_confirmed": affiliation_confirmed,
         "role_consistent": role_consistent,
         "evidence": evidence,
         "flags": flags,
         "summary": summary,
-        "cost_usd": 0.0,  # Placeholder - would calculate based on API usage
-        "sources": sources  # Include sources for collision detection
+        "cost_usd": 0.0,
+        "sources": sources
     }
-
-    return result
 
 
 @st.cache_data(ttl=3600)
@@ -946,6 +929,7 @@ def validate_use_case(use_case: str) -> Dict:
     openai_key = _get_api_key("OPENAI_API_KEY")
 
     if not openai_key:
+        st.warning("OpenAI API key not configured — LLM use-case validation skipped.")
         return {"sufficient": True, "feedback": ""}
 
     try:
