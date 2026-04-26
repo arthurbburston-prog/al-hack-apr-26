@@ -543,7 +543,9 @@ def extract_name_from_email(email: str) -> str:
 
 def analyze_affiliation_confirmed(name: str, email: str, institution: str, company: str, sources: List[Dict]) -> bool:
     """Determine if affiliation is confirmed."""
-    email_domain = _get_email_domain(email)
+    email_domain = email.split("@")[1] if "@" in email else ""
+
+    # Check for institutional domains
     institutional_domains = [".edu", ".ac.uk", ".gov", ".org"]
     is_institutional_email = any(domain in email_domain for domain in institutional_domains)
 
@@ -626,34 +628,43 @@ def generate_flags(name: str, email: str, institution: str, company: str, source
     """Generate flags based on analysis."""
     flags = []
 
+    # Check for name collisions using the new candidate data
     for source in sources:
         if source and source.get("source") == "OpenAlex":
             all_candidates = source.get("data", {}).get("all_candidates", 1)
-            if all_candidates > COLLISION_MIN_CANDIDATES:
+            if all_candidates > 2:
                 flags.append("name_collision")
             break
 
+    # Check institution/company not found - be more lenient
     affiliation_found = False
     for source in sources:
         if source and source.get("source") == "OpenAlex":
-            aff_names = source.get("data", {}).get("affiliations", [])
-            aff_str = " ".join(aff_names).lower()
-            sig_words = [w for term in (institution, company) if term
-                         for w in term.lower().split() if len(w) > 3]
-            if sig_words and any(word in aff_str for word in sig_words):
+            data_str = json.dumps(source.get("data", {})).lower()
+            # More flexible matching - check for partial matches
+            if institution and any(word in data_str for word in institution.lower().split()):
                 affiliation_found = True
-            break
+                break
+            if company and any(word in data_str for word in company.lower().split()):
+                affiliation_found = True
+                break
 
     if not affiliation_found and (institution or company):
         flags.append("institution_not_found")
 
-    email_domain = _get_email_domain(email)
-    if email_domain and institution:
+    # Email domain mismatch - be more intelligent
+    if email and "@" in email:
+        email_domain = email.split("@")[1].lower()
+        # Check for common institutional patterns
         institutional_patterns = [".edu", ".ac.", ".gov", ".org", ".com"]
         is_institutional_email = any(pattern in email_domain for pattern in institutional_patterns)
-        common_research_domains = {"nih.gov", "cdc.gov", "who.int", "un.org"}
-        if not is_institutional_email and email_domain not in common_research_domains:
-            flags.append("email_domain_mismatch")
+
+        # Only flag if we have an institution but email doesn't seem institutional
+        if institution and not is_institutional_email:
+            # Allow some common mismatches (e.g., research institutes)
+            common_research_domains = ["nih.gov", "cdc.gov", "who.int", "un.org"]
+            if email_domain not in common_research_domains:
+                flags.append("email_domain_mismatch")
 
     return flags
 
@@ -855,6 +866,7 @@ def perform_professional_footprint_check(
             linkedin_url=linkedin_url,
             institution=institution,
             company=company,
+            orcid="",  # Not in input as requested
             use_case=use_case,
             api_results=sources
         )
@@ -871,7 +883,7 @@ def perform_professional_footprint_check(
                     "affiliation_confirmed": affiliation_confirmed,
                     "role_consistent": role_consistent,
                     "evidence": evidence + (llm_result.get("evidence", [])),
-                    "flags": list(dict.fromkeys(flags + llm_result.get("flags", []))),
+                    "flags": flags + (llm_result.get("flags", [])),
                     "summary": f"{summary} (LLM analysis: {llm_result.get('summary', '')})",
                     "cost_usd": 0.0,  # Would calculate actual costs
                     "llm_enhanced": True,
@@ -976,8 +988,7 @@ def validate_use_case(use_case: str) -> Dict:
             "sufficient": bool(result.get("sufficient", True)),
             "feedback": result.get("feedback", "")
         }
-    except Exception as e:
-        st.warning(f"Use case validation failed: {str(e)}")
+    except Exception:
         return {"sufficient": True, "feedback": ""}
 
 
@@ -1045,7 +1056,15 @@ def main():
         options = ["Skip this source (use other data only)"]
 
         for i, candidate in enumerate(candidates):
-            affs = _extract_affiliations(candidate.get("affiliations", []))[:2]
+            raw_affs = candidate.get("affiliations", [])[:2]
+            affs = []
+            for aff in raw_affs:
+                if isinstance(aff, str):
+                    affs.append(aff)
+                elif isinstance(aff, dict) and aff.get("institution"):
+                    display = aff["institution"].get("display_name", "")
+                    if display:
+                        affs.append(display)
             works = candidate.get("works_count", 0)
             cited = candidate.get("cited_by_count", 0)
             score = candidate.get("_relevance_score", 0)

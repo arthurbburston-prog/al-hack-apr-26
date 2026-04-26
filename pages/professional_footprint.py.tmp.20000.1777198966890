@@ -11,9 +11,6 @@ import openai
 # ── API Configuration ──────────────────────────────────────────────────────
 
 API_TIMEOUT = 30  # seconds per API call
-COLLISION_SCORE_THRESHOLD = 30
-COLLISION_MIN_CANDIDATES = 2
-
 
 def _get_api_key(key: str) -> Optional[str]:
     """Get API key from secrets, return None if not configured."""
@@ -65,57 +62,61 @@ Hard Rules
 """
 
 
-# ── Shared Helpers ─────────────────────────────────────────────────────────
-
-def _get_email_domain(email: str) -> str:
-    """Return the domain part of an email address, lower-cased, or empty string."""
-    return email.split("@")[1].lower() if "@" in email else ""
-
-
-def _extract_affiliations(raw_affs: list) -> List[str]:
-    """Extract display_name strings from a raw OpenAlex affiliations list."""
-    result = []
-    for aff in raw_affs:
-        if isinstance(aff, str):
-            result.append(aff)
-        elif isinstance(aff, dict) and aff.get("institution"):
-            name = aff["institution"].get("display_name", "")
-            if name:
-                result.append(name)
-    return result
-
-
 # ── API Query Functions ────────────────────────────────────────────────────
 
-def _candidate_matches_institution(candidate: Dict, inst_words: set) -> bool:
-    """Return True if any significant institution word appears in the candidate's affiliations."""
-    for aff in candidate.get("affiliations", []):
-        if isinstance(aff, dict) and aff.get("institution"):
-            aff_name = aff["institution"].get("display_name", "").lower()
-            if any(word in aff_name for word in inst_words):
-                return True
-    return False
+def query_orcid(orcid: str) -> Optional[Dict]:
+    """Query ORCID API for researcher profile."""
+    if not orcid:
+        return None
+
+    try:
+        url = f"https://pub.orcid.org/v3.0/{orcid}/record"
+        headers = {"Accept": "application/json"}
+        response = requests.get(url, headers=headers, timeout=API_TIMEOUT)
+        response.raise_for_status()
+
+        data = response.json()
+        return {
+            "source": "ORCID",
+            "data": data,
+            "url": url,
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception:
+        return None
 
 
 def score_openalex_result(result: Dict, institution: str = "", email: str = "") -> float:
     """Score how well an OpenAlex result matches the expected profile."""
     score = 0.0
 
-    affiliations = _extract_affiliations(result.get("affiliations", []))
+    # Affiliation match (40 points max)
+    affiliations = []
+    for aff in result.get("affiliations", []):
+        if isinstance(aff, dict) and aff.get("institution"):
+            aff_name = aff["institution"].get("display_name", "")
+            if aff_name:
+                affiliations.append(aff_name)
 
     if institution and affiliations:
+        # Exact match gets full points
         if any(institution.lower() == aff.lower() for aff in affiliations):
             score += 40
+        # Partial match gets partial points
         elif any(institution.lower() in aff.lower() for aff in affiliations):
             score += 25
+        # Related institution (university, research institute) gets some points
         elif any(word in " ".join(affiliations).lower() for word in ["university", "college", "institute", "laboratory", "center"]):
             score += 15
 
-    domain = _get_email_domain(email)
-    if domain:
+    # Email domain match (20 points)
+    if email and "@" in email:
+        domain = email.split("@")[1].lower()
+        # Check if domain appears in any affiliation
         if any(domain in aff.lower() for aff in affiliations):
             score += 20
-        elif domain.endswith((".edu", ".ac.uk", ".ac.nz", ".ac.au")) and affiliations:
+        # Academic domains get bonus points
+        elif domain in ["edu", "ac.uk", "ac.nz", "ac.au"] and affiliations:
             score += 10
 
     # Publication count (20 points max)
@@ -158,8 +159,8 @@ def query_openalex(name: str, institution: str = "", email: str = "", field: str
             search_strategies.append(f'"{name}" {field}')
 
         # Name + email domain
-        domain = _get_email_domain(email)
-        if domain:
+        if email and "@" in email:
+            domain = email.split("@")[1]
             search_strategies.append(f'"{name}" {domain}')
 
         # Fallback: just quoted name
@@ -190,16 +191,16 @@ def query_openalex(name: str, institution: str = "", email: str = "", field: str
         all_results.sort(key=lambda x: x.get("_relevance_score", 0), reverse=True)
         best_result = all_results[0]
 
-        good_candidates = [r for r in all_results if r.get("_relevance_score", 0) >= COLLISION_SCORE_THRESHOLD]
+        # Check for collision (multiple good candidates)
+        good_candidates = [r for r in all_results if r.get("_relevance_score", 0) >= 20]  # Candidates with decent scores
 
-        if institution:
-            inst_words = {w.lower() for w in institution.split()
-                          if len(w) > 3 and w.lower() not in {"with", "and", "for", "the"}}
-            if inst_words:
-                good_candidates = [c for c in good_candidates
-                                   if _candidate_matches_institution(c, inst_words)]
-
-        affiliations = _extract_affiliations(best_result.get("affiliations", []))
+        # Extract affiliation names for the result
+        affiliations = []
+        for aff in best_result.get("affiliations", []):
+            if isinstance(aff, dict) and aff.get("institution"):
+                aff_name = aff["institution"].get("display_name", "")
+                if aff_name:
+                    affiliations.append(aff_name)
 
         result_data = {
             "source": "OpenAlex",
@@ -212,7 +213,7 @@ def query_openalex(name: str, institution: str = "", email: str = "", field: str
                 "cited_by_count": best_result.get("cited_by_count", 0),
                 "affiliations": affiliations,
                 "all_candidates": len(good_candidates),
-                "collision_candidates": good_candidates[:5] if len(good_candidates) > COLLISION_MIN_CANDIDATES else []
+                "collision_candidates": good_candidates[:5] if len(good_candidates) > 2 else []  # Top 5 for UI
             },
             "url": f"https://api.openalex.org/authors?search={quote(best_result.get('_search_term', name))}",
             "timestamp": datetime.now().isoformat()
@@ -543,7 +544,9 @@ def extract_name_from_email(email: str) -> str:
 
 def analyze_affiliation_confirmed(name: str, email: str, institution: str, company: str, sources: List[Dict]) -> bool:
     """Determine if affiliation is confirmed."""
-    email_domain = _get_email_domain(email)
+    email_domain = email.split("@")[1] if "@" in email else ""
+
+    # Check for institutional domains
     institutional_domains = [".edu", ".ac.uk", ".gov", ".org"]
     is_institutional_email = any(domain in email_domain for domain in institutional_domains)
 
@@ -626,34 +629,43 @@ def generate_flags(name: str, email: str, institution: str, company: str, source
     """Generate flags based on analysis."""
     flags = []
 
+    # Check for name collisions using the new candidate data
     for source in sources:
         if source and source.get("source") == "OpenAlex":
             all_candidates = source.get("data", {}).get("all_candidates", 1)
-            if all_candidates > COLLISION_MIN_CANDIDATES:
+            if all_candidates > 2:
                 flags.append("name_collision")
             break
 
+    # Check institution/company not found - be more lenient
     affiliation_found = False
     for source in sources:
         if source and source.get("source") == "OpenAlex":
-            aff_names = source.get("data", {}).get("affiliations", [])
-            aff_str = " ".join(aff_names).lower()
-            sig_words = [w for term in (institution, company) if term
-                         for w in term.lower().split() if len(w) > 3]
-            if sig_words and any(word in aff_str for word in sig_words):
+            data_str = json.dumps(source.get("data", {})).lower()
+            # More flexible matching - check for partial matches
+            if institution and any(word in data_str for word in institution.lower().split()):
                 affiliation_found = True
-            break
+                break
+            if company and any(word in data_str for word in company.lower().split()):
+                affiliation_found = True
+                break
 
     if not affiliation_found and (institution or company):
         flags.append("institution_not_found")
 
-    email_domain = _get_email_domain(email)
-    if email_domain and institution:
+    # Email domain mismatch - be more intelligent
+    if email and "@" in email:
+        email_domain = email.split("@")[1].lower()
+        # Check for common institutional patterns
         institutional_patterns = [".edu", ".ac.", ".gov", ".org", ".com"]
         is_institutional_email = any(pattern in email_domain for pattern in institutional_patterns)
-        common_research_domains = {"nih.gov", "cdc.gov", "who.int", "un.org"}
-        if not is_institutional_email and email_domain not in common_research_domains:
-            flags.append("email_domain_mismatch")
+
+        # Only flag if we have an institution but email doesn't seem institutional
+        if institution and not is_institutional_email:
+            # Allow some common mismatches (e.g., research institutes)
+            common_research_domains = ["nih.gov", "cdc.gov", "who.int", "un.org"]
+            if email_domain not in common_research_domains:
+                flags.append("email_domain_mismatch")
 
     return flags
 
@@ -745,10 +757,16 @@ def perform_professional_footprint_check(
     confidence = "low"
     flags = []
 
-    # ORCID is queried via fetch_orcid_affiliations() in the collision UI when a candidate has an ORCID id.
-    # OpenAlex
+    # 1. ORCID (skipped - not in input)
+    # 2. OpenAlex
     if selected_candidate:
-        affiliations = _extract_affiliations(selected_candidate.get("affiliations", []))
+        # Use the user-selected candidate
+        affiliations = []
+        for aff in selected_candidate.get("affiliations", []):
+            if isinstance(aff, dict) and aff.get("institution"):
+                aff_name = aff["institution"].get("display_name", "")
+                if aff_name:
+                    affiliations.append(aff_name)
 
         openalex_result = {
             "source": "OpenAlex",
@@ -855,6 +873,7 @@ def perform_professional_footprint_check(
             linkedin_url=linkedin_url,
             institution=institution,
             company=company,
+            orcid="",  # Not in input as requested
             use_case=use_case,
             api_results=sources
         )
@@ -871,7 +890,7 @@ def perform_professional_footprint_check(
                     "affiliation_confirmed": affiliation_confirmed,
                     "role_consistent": role_consistent,
                     "evidence": evidence + (llm_result.get("evidence", [])),
-                    "flags": list(dict.fromkeys(flags + llm_result.get("flags", []))),
+                    "flags": flags + (llm_result.get("flags", [])),
                     "summary": f"{summary} (LLM analysis: {llm_result.get('summary', '')})",
                     "cost_usd": 0.0,  # Would calculate actual costs
                     "llm_enhanced": True,
@@ -893,48 +912,6 @@ def perform_professional_footprint_check(
     }
 
     return result
-
-
-@st.cache_data(ttl=3600)
-def fetch_orcid_affiliations(orcid_id: str) -> List[str]:
-    """
-    Fetch employment affiliations from an individual's ORCID record.
-    Returns a list of human-readable strings like "Professor, University of Cambridge (2000–present)".
-    Results are cached for 1 hour.
-    """
-    try:
-        url = f"https://pub.orcid.org/v3.0/{orcid_id}/record"
-        response = requests.get(url, headers={"Accept": "application/json"}, timeout=API_TIMEOUT)
-        response.raise_for_status()
-        data = response.json()
-
-        affiliations = []
-        activities = data.get("activities-summary", {})
-
-        for section in ("employments", "educations"):
-            groups = activities.get(section, {}).get("affiliation-group", [])
-            for group in groups:
-                for summary in group.get("summaries", []):
-                    key = "employment-summary" if section == "employments" else "education-summary"
-                    entry = summary.get(key, {})
-                    org = entry.get("organization", {}).get("name", "")
-                    if not org:
-                        continue
-                    role = entry.get("role-title", "") or entry.get("role", "")
-                    start = (entry.get("start-date") or {}).get("year", {}).get("value", "")
-                    end_raw = entry.get("end-date")
-                    end = end_raw.get("year", {}).get("value", "") if end_raw else "present"
-                    parts = []
-                    if role:
-                        parts.append(role)
-                    parts.append(org)
-                    if start:
-                        parts.append(f"({start}–{end})")
-                    affiliations.append(", ".join(parts))
-
-        return affiliations
-    except Exception:
-        return []
 
 
 def validate_use_case(use_case: str) -> Dict:
@@ -976,8 +953,7 @@ def validate_use_case(use_case: str) -> Dict:
             "sufficient": bool(result.get("sufficient", True)),
             "feedback": result.get("feedback", "")
         }
-    except Exception as e:
-        st.warning(f"Use case validation failed: {str(e)}")
+    except Exception:
         return {"sufficient": True, "feedback": ""}
 
 
@@ -1045,7 +1021,15 @@ def main():
         options = ["Skip this source (use other data only)"]
 
         for i, candidate in enumerate(candidates):
-            affs = _extract_affiliations(candidate.get("affiliations", []))[:2]
+            raw_affs = candidate.get("affiliations", [])[:2]
+            affs = []
+            for aff in raw_affs:
+                if isinstance(aff, str):
+                    affs.append(aff)
+                elif isinstance(aff, dict) and aff.get("institution"):
+                    display = aff["institution"].get("display_name", "")
+                    if display:
+                        affs.append(display)
             works = candidate.get("works_count", 0)
             cited = candidate.get("cited_by_count", 0)
             score = candidate.get("_relevance_score", 0)
@@ -1069,25 +1053,21 @@ def main():
             if 0 <= detail_idx < len(candidates):
                 detail = candidates[detail_idx]
 
+                # All affiliations with country code
+                all_affs = []
+                for aff in detail.get("affiliations", []):
+                    if isinstance(aff, dict) and aff.get("institution"):
+                        inst = aff["institution"]
+                        name = inst.get("display_name", "")
+                        country = inst.get("country_code", "")
+                        if name:
+                            all_affs.append(f"{name} ({country})" if country else name)
+                    elif isinstance(aff, str):
+                        all_affs.append(aff)
+
                 concepts = _top_concepts(detail, n=3)
                 profile_url = detail.get("id", "")
                 orcid = detail.get("ids", {}).get("orcid", "") if isinstance(detail.get("ids"), dict) else ""
-
-                # Prefer ORCID affiliations (individual-specific) over OpenAlex aggregates
-                if orcid:
-                    orcid_id = orcid.rstrip("/").split("/")[-1]
-                    all_affs = fetch_orcid_affiliations(orcid_id)
-                else:
-                    all_affs = []
-                    for aff in detail.get("affiliations", []):
-                        if isinstance(aff, dict) and aff.get("institution"):
-                            inst = aff["institution"]
-                            aff_name = inst.get("display_name", "")
-                            country = inst.get("country_code", "")
-                            if aff_name:
-                                all_affs.append(f"{aff_name} ({country})" if country else aff_name)
-                        elif isinstance(aff, str):
-                            all_affs.append(aff)
 
                 lines = [f"**{detail.get('display_name', 'Unknown')}**"]
                 if all_affs:

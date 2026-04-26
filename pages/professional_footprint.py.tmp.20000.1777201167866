@@ -638,8 +638,7 @@ def generate_flags(name: str, email: str, institution: str, company: str, source
         if source and source.get("source") == "OpenAlex":
             aff_names = source.get("data", {}).get("affiliations", [])
             aff_str = " ".join(aff_names).lower()
-            sig_words = [w for term in (institution, company) if term
-                         for w in term.lower().split() if len(w) > 3]
+            sig_words = [w for w in (institution or company or "").lower().split() if len(w) > 3]
             if sig_words and any(word in aff_str for word in sig_words):
                 affiliation_found = True
             break
