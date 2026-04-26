@@ -1004,26 +1004,26 @@ def main():
         st.session_state.original_inputs = None
 
     # Input form
-    with st.form("footprint_check"):
-        col1, col2 = st.columns(2)
+    col1, col2 = st.columns(2)
 
-        with col1:
-            name = st.text_input("Full Name", placeholder="Dr. Jane Smith")
-            email = st.text_input("Email Address", placeholder="jane.smith@university.edu")
+    with col1:
+        name = st.text_input("Full Name", placeholder="Dr. Jane Smith", key="pf_name")
+        email = st.text_input("Email Address", placeholder="jane.smith@university.edu", key="pf_email")
 
-        with col2:
-            institution = st.text_input("Institution (optional)", placeholder="Stanford University")
-            company = st.text_input("Company (optional)", placeholder="Research Corp")
+    with col2:
+        institution = st.text_input("Institution (optional)", placeholder="Stanford University", key="pf_institution")
+        company = st.text_input("Company (optional)", placeholder="Research Corp", key="pf_company")
 
-        linkedin_url = st.text_input("LinkedIn URL (optional)", placeholder="https://linkedin.com/in/janesmith")
+    linkedin_url = st.text_input("LinkedIn URL (optional)", placeholder="https://linkedin.com/in/janesmith", key="pf_linkedin")
 
-        use_case = st.text_area(
-            "Use Case (2-4 sentences)",
-            placeholder="Describe how this person intends to use the product. Include their field of work and research interests.",
-            height=100
-        )
+    use_case = st.text_area(
+        "Use Case (2-4 sentences)",
+        placeholder="Describe how this person intends to use the product. Include their field of work and research interests.",
+        height=100,
+        key="pf_use_case"
+    )
 
-        submitted = st.form_submit_button("Run Footprint Check")
+    submitted = st.button("Run Footprint Check")
 
     # A fresh submission always resets collision state
     if submitted:
