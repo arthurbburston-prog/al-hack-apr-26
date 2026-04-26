@@ -188,19 +188,28 @@ def query_openalex(name: str, institution: str = "", email: str = "", field: str
 
         # Sort by relevance score and get the best match
         all_results.sort(key=lambda x: x.get("_relevance_score", 0), reverse=True)
-        best_result = all_results[0]
+
+        _generic = {"with", "and", "for", "the", "university", "college", "institute",
+                    "institution", "laboratory", "center", "centre",
+                    "school", "department", "faculty", "research", "national", "royal"}
+        inst_words = set()
+        if institution:
+            inst_words = {w.lower() for w in institution.split()
+                          if len(w) > 3 and w.lower() not in _generic}
+
+        # When institution is known, prefer a candidate from that institution over
+        # a higher-scoring famous namesake at a different one.
+        if inst_words:
+            institution_matched = [r for r in all_results if _candidate_matches_institution(r, inst_words)]
+            best_result = institution_matched[0] if institution_matched else all_results[0]
+        else:
+            best_result = all_results[0]
 
         good_candidates = [r for r in all_results if r.get("_relevance_score", 0) >= COLLISION_SCORE_THRESHOLD]
 
-        if institution:
-            _generic = {"with", "and", "for", "the", "university", "college", "institute",
-                        "institution", "laboratory", "laboratory", "center", "centre",
-                        "school", "department", "faculty", "research", "national", "royal"}
-            inst_words = {w.lower() for w in institution.split()
-                          if len(w) > 3 and w.lower() not in _generic}
-            if inst_words:
-                good_candidates = [c for c in good_candidates
-                                   if _candidate_matches_institution(c, inst_words)]
+        if inst_words:
+            good_candidates = [c for c in good_candidates
+                               if _candidate_matches_institution(c, inst_words)]
 
         affiliations = _extract_affiliations(best_result.get("affiliations", []))
 
