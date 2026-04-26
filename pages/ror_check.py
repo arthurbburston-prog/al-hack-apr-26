@@ -1,5 +1,5 @@
 import streamlit as st
-from pages.ror_utils import search_ror_institution, check_email_domain_match
+from utils.ror_utils import search_ror_institution, check_email_domain_match
 
 
 def main():
@@ -13,10 +13,10 @@ def main():
     col1, col2 = st.columns(2)
 
     with col1:
-        email = st.text_input("Researcher Email", placeholder="researcher@university.edu")
+        email = st.text_input("Researcher Email", placeholder="researcher@university.edu", key="ror_email")
 
     with col2:
-        institution_name = st.text_input("Institution Name", placeholder="Stanford University")
+        institution_name = st.text_input("Institution Name", placeholder="Stanford University", key="ror_institution")
 
     if st.button("Check Email Domain", key="ror_check_button"):
         if not email or not institution_name:

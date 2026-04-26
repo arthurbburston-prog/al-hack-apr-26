@@ -61,7 +61,7 @@ if st.session_state.otp_verified:
     st.stop()
 
 # ── Step 1: enter email and request OTP ─────────────────────────────────────
-email = st.text_input("Email address", placeholder="user@example.com")
+email = st.text_input("Email address", placeholder="user@example.com", key="otp_email_input")
 
 col1, col2 = st.columns([1, 3])
 with col1:

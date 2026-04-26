@@ -79,6 +79,7 @@ with tab1:
         "Card BIN (first 6 digits — safe to enter, no full card number needed)",
         placeholder="411111",
         max_chars=8,
+        key="pay_bin",
     )
 
     if st.button("Look up BIN", disabled=not bin_input):
@@ -131,21 +132,23 @@ with tab2:
     col_a, col_b = st.columns(2)
     with col_a:
         st.markdown("**Claimed identity**")
-        claimed_name = st.text_input("Full name (as entered at checkout)", placeholder="Jane Smith")
-        claimed_country = st.text_input("Claimed country (2-letter ISO)", placeholder="US", max_chars=2)
+        claimed_name = st.text_input("Full name (as entered at checkout)", placeholder="Jane Smith", key="pay_claimed_name")
+        claimed_country = st.text_input("Claimed country (2-letter ISO)", placeholder="US", max_chars=2, key="pay_claimed_country")
 
     with col_b:
         st.markdown("**Payment processor response**")
-        card_name = st.text_input("Name on card (if returned by processor)", placeholder="J SMITH")
+        card_name = st.text_input("Name on card (if returned by processor)", placeholder="J SMITH", key="pay_card_name")
         avs_code = st.selectbox(
             "AVS result code",
             options=["(not checked)"] + list(AVS_CODES.keys()),
+            key="pay_avs_code",
         )
         cvv_code = st.selectbox(
             "CVV result code",
             options=["(not checked)"] + list(CVV_CODES.keys()),
+            key="pay_cvv_code",
         )
-        card_country = st.text_input("Card-issuing country from BIN lookup", placeholder="US", max_chars=2)
+        card_country = st.text_input("Card-issuing country from BIN lookup", placeholder="US", max_chars=2, key="pay_card_country")
 
     if st.button("Run consistency check"):
         flags = []

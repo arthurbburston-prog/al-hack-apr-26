@@ -38,10 +38,9 @@ for key, default in {"voucher_result": None, "voucher_checked": False}.items():
         st.session_state[key] = default
 
 # ── Form ──────────────────────────────────────────────────────────────────────
-with st.form("voucher_form"):
-    voucher_input = st.text_input("Voucher name", placeholder="e.g. Sarah Chen")
-    email_input = st.text_input("Your email address", placeholder="you@example.com")
-    submitted = st.form_submit_button("Check Reference")
+voucher_input = st.text_input("Voucher name", placeholder="e.g. Sarah Chen", key="voucher_name")
+email_input = st.text_input("Your email address", placeholder="you@example.com", key="voucher_email")
+submitted = st.button("Check Reference")
 
 if submitted:
     voucher_key = voucher_input.strip().lower()

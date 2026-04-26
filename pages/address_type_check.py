@@ -71,16 +71,15 @@ def _lookup_address(street: str, city: str, state: str, zipcode: str) -> dict:
 
 
 # ── Form ─────────────────────────────────────────────────────────────────────
-with st.form("address_form"):
-    street = st.text_input("Street address", placeholder="123 Main St Apt 4B")
-    col1, col2, col3 = st.columns([3, 1, 1])
-    with col1:
-        city = st.text_input("City", placeholder="Springfield")
-    with col2:
-        state = st.text_input("State", placeholder="IL", max_chars=2)
-    with col3:
-        zipcode = st.text_input("ZIP", placeholder="62701", max_chars=10)
-    submitted = st.form_submit_button("Check Address")
+street = st.text_input("Street address", placeholder="123 Main St Apt 4B", key="addr_street")
+col1, col2, col3 = st.columns([3, 1, 1])
+with col1:
+    city = st.text_input("City", placeholder="Springfield", key="addr_city")
+with col2:
+    state = st.text_input("State", placeholder="IL", max_chars=2, key="addr_state")
+with col3:
+    zipcode = st.text_input("ZIP", placeholder="62701", max_chars=10, key="addr_zip")
+submitted = st.button("Check Address")
 
 if submitted:
     if not street:
