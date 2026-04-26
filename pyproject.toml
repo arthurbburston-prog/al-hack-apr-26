@@ -5,6 +5,8 @@ description = "KYC all-in-one: multi-source professional footprint and instituti
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "anthropic>=0.97.0",
+    "requests>=2.33.1",
     "streamlit>=1.56.0",
     "requests>=2.31.0",
     "openai>=1.0.0",
