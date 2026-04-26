@@ -1,177 +1,10 @@
 import streamlit as st
-import requests
 import random
 import smtplib
 import time
 from email.mime.text import MIMEText
-from urllib.parse import urlparse
-from typing import Dict, List, Tuple, Optional
 
-
-# ── ROR Check Functions ──────────────────────────────────────────────────────
-
-def extract_email_domain(email: str) -> Optional[str]:
-    """Extract domain from email address."""
-    if "@" not in email:
-        return None
-    return email.split("@")[1].lower()
-
-
-def search_ror_institution(institution_name: str) -> Dict:
-    """
-    Search for an institution in the ROR database.
-
-    Returns:
-        Dict with status, data, and error message
-    """
-    try:
-        # ROR API search endpoint
-        url = "https://api.ror.org/organizations"
-        params = {"query": institution_name}
-
-        response = requests.get(url, params=params, timeout=10)
-        response.raise_for_status()
-
-        data = response.json()
-
-        if data.get("number_of_results", 0) == 0:
-            return {
-                "status": "error",
-                "data": None,
-                "message": f"No institutions found matching '{institution_name}'"
-            }
-
-        # Return the top result
-        results = data.get("items", [])
-        if results:
-            return {
-                "status": "success",
-                "data": results,
-                "message": None
-            }
-
-        return {
-            "status": "error",
-            "data": None,
-            "message": "No results returned from ROR API"
-        }
-
-    except requests.exceptions.Timeout:
-        return {
-            "status": "error",
-            "data": None,
-            "message": "Request to ROR API timed out"
-        }
-    except requests.exceptions.RequestException as e:
-        return {
-            "status": "error",
-            "data": None,
-            "message": f"Failed to contact ROR API: {str(e)}"
-        }
-    except Exception as e:
-        return {
-            "status": "error",
-            "data": None,
-            "message": f"Unexpected error: {str(e)}"
-        }
-
-
-def extract_domains_from_institution(institution: Dict) -> List[str]:
-    """Extract all domains associated with a ROR institution."""
-    domains = []
-
-    # Get primary domain from links
-    if "links" in institution:
-        for link in institution.get("links", []):
-            if link.get("type") == "website":
-                # Note: ROR API uses "value" not "href"
-                url = link.get("value", "")
-                if url:
-                    domain = urlparse(url).netloc.lower()
-                    if domain.startswith("www."):
-                        domain = domain[4:]
-                    if domain:
-                        domains.append(domain)
-
-    # Also check the "domains" field in ROR (if available)
-    if "domains" in institution:
-        for domain_entry in institution.get("domains", []):
-            if isinstance(domain_entry, str):
-                domain = domain_entry.lower()
-                if domain.startswith("www."):
-                    domain = domain[4:]
-                if domain:
-                    domains.append(domain)
-            elif isinstance(domain_entry, dict) and "domain" in domain_entry:
-                domain = domain_entry["domain"].lower()
-                if domain.startswith("www."):
-                    domain = domain[4:]
-                if domain:
-                    domains.append(domain)
-
-    return list(set(domains))  # Remove duplicates
-
-
-def check_email_domain_match(email: str, institution_data: List[Dict]) -> Tuple[str, float, List[Dict]]:
-    """
-    Check if email domain matches any domain in the institution data.
-
-    Returns:
-        Tuple of (status: str, confidence: float, evidence: List[Dict])
-    """
-    email_domain = extract_email_domain(email)
-
-    if not email_domain:
-        return "fail", 0.0, [{"type": "error", "message": "Invalid email format"}]
-
-    evidence = []
-    evidence.append({
-        "type": "email_domain",
-        "value": email_domain,
-        "description": f"Extracted domain from email"
-    })
-
-    matched_institutions = []
-
-    for institution in institution_data:
-        inst_name = institution.get("name", "Unknown")
-        inst_id = institution.get("id", "")
-
-        institution_domains = extract_domains_from_institution(institution)
-
-        evidence.append({
-            "type": "institution_info",
-            "institution_name": inst_name,
-            "ror_id": inst_id,
-            "domains": institution_domains,
-            "description": f"Domains associated with {inst_name}"
-        })
-
-        # Check for exact domain match
-        for domain in institution_domains:
-            if email_domain == domain:
-                matched_institutions.append({
-                    "name": inst_name,
-                    "ror_id": inst_id,
-                    "matched_domain": domain
-                })
-
-    if matched_institutions:
-        evidence.append({
-            "type": "match_result",
-            "matched": True,
-            "matched_institutions": matched_institutions,
-            "description": "Email domain matches institution domain(s)"
-        })
-        return "pass", 1.0, evidence
-    else:
-        evidence.append({
-            "type": "match_result",
-            "matched": False,
-            "matched_institutions": [],
-            "description": "Email domain does not match any institution domain"
-        })
-        return "fail", 0.0, evidence
+from pages.ror_utils import search_ror_institution, check_email_domain_match
 
 
 # ── Email OTP Functions ──────────────────────────────────────────────────────
@@ -216,6 +49,10 @@ def main():
 
     # ── Session State Initialization ──────────────────────────────────────────
     session_keys = {
+        # Input state
+        "ror_email": None,
+        "ror_institution": None,
+
         # ROR check state
         "ror_status": None,
         "ror_confidence": 0.0,
@@ -241,7 +78,6 @@ def main():
     # ── Step Navigation ──────────────────────────────────────────────────────
     if st.session_state.current_step == "complete":
         if st.button("Start New Check"):
-            # Reset all state
             for key in session_keys:
                 st.session_state[key] = session_keys[key]
             st.rerun()
@@ -271,7 +107,6 @@ def main():
         st.header("🏫 Step 2: Institution Domain Verification")
 
         with st.spinner("Checking ROR database..."):
-            # Perform ROR check
             ror_response = search_ror_institution(st.session_state.ror_institution)
 
             if ror_response["status"] == "error":
@@ -282,7 +117,6 @@ def main():
                     st.rerun()
                 st.stop()
 
-            # Check email domain match
             status, confidence, evidence = check_email_domain_match(
                 st.session_state.ror_email,
                 ror_response["data"]
@@ -293,18 +127,16 @@ def main():
             st.session_state.ror_evidence = evidence
             st.session_state.ror_completed = True
 
-        # Display ROR results
         if status == "pass":
             st.success("✅ **ROR Check PASSED** - Email domain verified with institution")
             st.info("Proceeding to email ownership verification...")
             st.session_state.current_step = "otp_check"
-            time.sleep(2)  # Brief pause for user to see result
+            time.sleep(2)
             st.rerun()
         else:
             st.error("❌ **ROR Check FAILED** - Email domain does not match institution")
             st.session_state.current_step = "complete"
 
-            # Show evidence
             with st.expander("View ROR Check Details", expanded=True):
                 for item in evidence:
                     if item["type"] == "email_domain":
@@ -327,17 +159,14 @@ def main():
     elif st.session_state.current_step == "otp_check":
         st.header("📧 Step 3: Email Ownership Verification")
 
-        # Only proceed if ROR passed
         if st.session_state.ror_status != "pass":
             st.error("Cannot perform email verification - ROR check did not pass")
             st.session_state.current_step = "complete"
             st.rerun()
 
-        # Email OTP logic (adapted from email_otp.py)
-        OTP_EXPIRY_SECONDS = 300  # 5 minutes
+        OTP_EXPIRY_SECONDS = 300
         MAX_ATTEMPTS = 5
 
-        # Use the same email from ROR check
         email = st.session_state.ror_email
 
         st.info(f"📧 Verifying ownership of: **{email}**")
@@ -347,7 +176,6 @@ def main():
             st.success(f"✅ **COMPLETE SUCCESS!** Email ownership verified for {email}")
             st.session_state.current_step = "complete"
 
-            # Show combined results
             st.balloons()
             col1, col2 = st.columns(2)
             with col1:

@@ -1,3 +1,9 @@
 *.env
 *.secret
 *.ignoreme
+*.pyc
+__pycache__/
+.venv/
+
+# Streamlit secrets
+.streamlit/secrets.toml
